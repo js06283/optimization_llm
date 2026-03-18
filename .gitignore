@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.DS_Store
+
+# Keep the Overleaf repo fully separate from the root GitHub repo.
+latex/

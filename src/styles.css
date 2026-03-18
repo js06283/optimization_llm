@@ -1,0 +1,87 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  min-width: 1280px;
+  font-family:
+    "SF Pro Text",
+    "Segoe UI",
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+  color: #24303b;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: #264653;
+}
+
+input[type="number"],
+textarea {
+  width: 100%;
+  border: 1px solid #d7dde3;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #fff;
+  color: #24303b;
+}
+
+.app-button {
+  border: 1px solid #d7dde3;
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+}
+
+.app-button:hover {
+  transform: translateY(-1px);
+}
+
+.app-button.primary {
+  background: #264653;
+  border-color: #264653;
+  color: #fff;
+}
+
+.app-button.secondary {
+  background: #fff;
+  color: #24303b;
+}
+
+.app-button.ghost {
+  background: #fff;
+  padding: 2px 8px;
+  border-radius: 8px;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: auto 1fr 72px;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.check-row.compact {
+  grid-template-columns: auto 1fr;
+}
