@@ -50,7 +50,13 @@ textarea {
     background-color 140ms ease,
     border-color 140ms ease,
     color 140ms ease,
-    transform 140ms ease;
+  transform 140ms ease;
+}
+
+.app-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
 }
 
 .app-button:hover {
@@ -84,4 +90,74 @@ textarea {
 
 .check-row.compact {
   grid-template-columns: auto 1fr;
+}
+
+.solver-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid #c7d4db;
+  border-top-color: #274c57;
+  animation: solver-spin 0.9s linear infinite;
+}
+
+.solver-spinner.idle {
+  animation: none;
+  border-color: #c7d4db;
+  border-top-color: #c7d4db;
+  background: #dfe7eb;
+}
+
+@keyframes solver-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.grid-pulse {
+  animation: grid-pulse 0.7s ease-out;
+}
+
+@keyframes grid-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(39, 76, 87, 0.22);
+    transform: scale(0.998);
+  }
+
+  60% {
+    box-shadow: 0 0 0 10px rgba(39, 76, 87, 0.08);
+    transform: scale(1);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(39, 76, 87, 0);
+    transform: scale(1);
+  }
+}
+
+.course-chip-tooltip {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  min-width: 150px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #24303b;
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.4;
+  box-shadow: 0 10px 24px rgba(36, 48, 59, 0.22);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+  z-index: 20;
+}
+
+.course-chip:hover .course-chip-tooltip {
+  opacity: 1;
 }
