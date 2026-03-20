@@ -170,18 +170,54 @@ const BRIEFINGS = [
   },
 ];
 
-const TRUE_WEIGHTS = {
-  coverage: 10,
-  timePenalty: 2,
-  compactnessPenalty: 2.5,
-  fridayBonus: 1,
+// Term library: all scoreable components the model spec can reference.
+// score(outcome) returns a positive raw value; sign indicates direction in utility.
+const TERM_LIBRARY = {
+  coverage: {
+    label: "Course coverage",
+    description: "Fraction of desired courses each student can attend without time conflicts.",
+    sign: +1,
+    defaultWeight: 10,
+    score: (outcome) => outcome.coverage,
+  },
+  time_penalty: {
+    label: "Time-of-day penalty",
+    description: "Per-course penalty for desired courses in each group's dispreferred time. Workers penalized for PM; athletes for MWF AM; commuters mildly for AM.",
+    sign: -1,
+    defaultWeight: 2,
+    score: (outcome) => outcome.timePenalty,
+  },
+  compactness: {
+    label: "Campus day compactness",
+    description: "Penalty for students having classes spread across many days or isolated single-block days.",
+    sign: -1,
+    defaultWeight: 2.5,
+    score: (outcome) => outcome.compactnessPenalty,
+  },
+  friday_bonus: {
+    label: "Friday-free bonus",
+    description: "Bonus for each student who has zero classes on Friday.",
+    sign: +1,
+    defaultWeight: 1,
+    score: (outcome) => outcome.fridayBonus,
+  },
 };
 
-const DEFAULT_WEIGHTS = {
-  coverage: 10,
-  timePenalty: 2,
-  compactnessPenalty: 2.5,
-  fridayBonus: 0,
+// The hidden true utility — known to the experimenter, never shown to participants.
+const TRUE_SPEC = {
+  terms: [
+    { id: "coverage", weight: 10 },
+    { id: "time_penalty", weight: 2 },
+    { id: "compactness", weight: 2.5 },
+    { id: "friday_bonus", weight: 1 },
+  ],
+};
+
+// The participant's starting model — only coverage active at round 0.
+const DEFAULT_MODEL_SPEC = {
+  terms: [
+    { id: "coverage", weight: 10 },
+  ],
 };
 
 const DEFAULT_CONSTRAINTS = {
@@ -365,13 +401,17 @@ function computeConstraintViolations(assignment, metrics, constraints) {
   return violations;
 }
 
-function evaluateAssignment(assignment, students, weights, constraints) {
-  const componentTotals = {
-    coverage: 0,
-    timePenalty: 0,
-    compactnessPenalty: 0,
-    fridayBonus: 0,
-  };
+function scoreSpec(spec, componentTotals) {
+  return spec.terms.reduce((sum, term) => {
+    const lib = TERM_LIBRARY[term.id];
+    if (!lib) return sum;
+    return sum + term.weight * lib.sign * componentTotals[term.id];
+  }, 0);
+}
+
+function evaluateAssignment(assignment, students, modelSpec, constraints) {
+  // Always accumulate raw totals for every term in the library.
+  const componentTotals = Object.fromEntries(Object.keys(TERM_LIBRARY).map((id) => [id, 0]));
 
   const perGroup = Object.fromEntries(
     Object.keys(GROUPS).map((group) => [
@@ -391,25 +431,25 @@ function evaluateAssignment(assignment, students, weights, constraints) {
 
   const studentRows = students.map((student) => {
     const outcome = computeStudentOutcome(student, assignment);
-    const utility =
-      TRUE_WEIGHTS.coverage * outcome.coverage -
-      TRUE_WEIGHTS.timePenalty * outcome.timePenalty -
-      TRUE_WEIGHTS.compactnessPenalty * outcome.compactnessPenalty +
-      TRUE_WEIGHTS.fridayBonus * outcome.fridayBonus;
 
-    componentTotals.coverage += outcome.coverage;
-    componentTotals.timePenalty += outcome.timePenalty;
-    componentTotals.compactnessPenalty += outcome.compactnessPenalty;
-    componentTotals.fridayBonus += outcome.fridayBonus;
+    Object.keys(TERM_LIBRARY).forEach((termId) => {
+      componentTotals[termId] += TERM_LIBRARY[termId].score(outcome);
+    });
+
+    // Per-student true utility for per-group tracking (always uses TRUE_SPEC).
+    const trueUtility = TRUE_SPEC.terms.reduce((sum, term) => {
+      const lib = TERM_LIBRARY[term.id];
+      return lib ? sum + term.weight * lib.sign * lib.score(outcome) : sum;
+    }, 0);
 
     const bucket = perGroup[student.group];
     bucket.count += 1;
-    bucket.totalUtility += utility;
+    bucket.totalUtility += trueUtility;
     bucket.avgDays += outcome.daysWithClasses;
     bucket.avgSingleBlockDays += outcome.singleBlockDays;
     if (outcome.coverage === 1) bucket.fullCoverage += 1;
 
-    return { ...outcome, id: student.id, group: student.group, utility };
+    return { ...outcome, id: student.id, group: student.group, utility: trueUtility };
   });
 
   Object.values(perGroup).forEach((bucket) => {
@@ -420,17 +460,8 @@ function evaluateAssignment(assignment, students, weights, constraints) {
     bucket.fullCoverageRate = bucket.fullCoverage / bucket.count;
   });
 
-  const surrogateScore =
-    weights.coverage * componentTotals.coverage -
-    weights.timePenalty * componentTotals.timePenalty -
-    weights.compactnessPenalty * componentTotals.compactnessPenalty +
-    weights.fridayBonus * componentTotals.fridayBonus;
-
-  const trueScore =
-    TRUE_WEIGHTS.coverage * componentTotals.coverage -
-    TRUE_WEIGHTS.timePenalty * componentTotals.timePenalty -
-    TRUE_WEIGHTS.compactnessPenalty * componentTotals.compactnessPenalty +
-    TRUE_WEIGHTS.fridayBonus * componentTotals.fridayBonus;
+  const surrogateScore = scoreSpec(modelSpec, componentTotals);
+  const trueScore = scoreSpec(TRUE_SPEC, componentTotals);
 
   const courseConflictCount = COURSE_DEFS.filter((course) => {
     const slotId = assignment[course.id];
@@ -469,7 +500,7 @@ function evaluateAssignment(assignment, students, weights, constraints) {
   };
 }
 
-function solveTimetable({ students, weights, constraints, seed, restarts, iterations }) {
+function solveTimetable({ students, modelSpec, constraints, seed, restarts, iterations }) {
   let bestAssignment = null;
   let bestMetrics = null;
 
@@ -490,7 +521,7 @@ function solveTimetable({ students, weights, constraints, seed, restarts, iterat
       TIMESLOTS.forEach((slot) => {
         if (loads[slot.id] >= slot.capacity) return;
         const trial = { ...assignment, [course.id]: slot.id };
-        const score = evaluateAssignment(trial, students, weights, constraints).penalizedSurrogate;
+        const score = evaluateAssignment(trial, students, modelSpec, constraints).penalizedSurrogate;
         if (score > bestScore) {
           bestScore = score;
           bestSlot = slot.id;
@@ -501,7 +532,7 @@ function solveTimetable({ students, weights, constraints, seed, restarts, iterat
       if (bestSlot) loads[bestSlot] += 1;
     });
 
-    let currentMetrics = evaluateAssignment(assignment, students, weights, constraints);
+    let currentMetrics = evaluateAssignment(assignment, students, modelSpec, constraints);
     let currentScore = currentMetrics.penalizedSurrogate;
 
     for (let step = 0; step < iterations; step += 1) {
@@ -519,7 +550,7 @@ function solveTimetable({ students, weights, constraints, seed, restarts, iterat
         [next[first.id], next[second.id]] = [next[second.id], next[first.id]];
       }
 
-      const nextMetrics = evaluateAssignment(next, students, weights, constraints);
+      const nextMetrics = evaluateAssignment(next, students, modelSpec, constraints);
       if (nextMetrics.penalizedSurrogate > currentScore || rng() < 0.015) {
         Object.assign(assignment, next);
         currentMetrics = nextMetrics;
@@ -537,7 +568,7 @@ function solveTimetable({ students, weights, constraints, seed, restarts, iterat
     const fallbackAssignment = createEmptyAssignment();
     return {
       assignment: fallbackAssignment,
-      metrics: evaluateAssignment(fallbackAssignment, students, weights, constraints),
+      metrics: evaluateAssignment(fallbackAssignment, students, modelSpec, constraints),
     };
   }
 
@@ -643,7 +674,7 @@ function DropZone({ id, title, subtitle, courses, load, activeCourseId, isHoldin
 function TimetableWorkbench() {
   const [round, setRound] = useState(1);
   const [studentSeed] = useState(BASELINE_SEED);
-  const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
+  const [modelSpec, setModelSpec] = useState(() => ({ terms: [...DEFAULT_MODEL_SPEC.terms.map(t => ({ ...t })) ] }));
   const [constraints, setConstraints] = useState({ ...DEFAULT_CONSTRAINTS });
   const [assignment, setAssignment] = useState(createEmptyAssignment);
   const [solverSeed, setSolverSeed] = useState(101);
@@ -659,12 +690,12 @@ function TimetableWorkbench() {
 
   const students = useMemo(() => generateStudents(studentSeed), [studentSeed]);
   const optimalMetrics = useMemo(
-    () => evaluateAssignment(PRECOMPUTED_OPTIMAL_ASSIGNMENT, students, TRUE_WEIGHTS, DEFAULT_CONSTRAINTS),
+    () => evaluateAssignment(PRECOMPUTED_OPTIMAL_ASSIGNMENT, students, TRUE_SPEC, DEFAULT_CONSTRAINTS),
     [students]
   );
   const currentMetrics = useMemo(
-    () => evaluateAssignment(assignment, students, weights, constraints),
-    [assignment, students, weights, constraints]
+    () => evaluateAssignment(assignment, students, modelSpec, constraints),
+    [assignment, students, modelSpec, constraints]
   );
 
   const percentOfReference =
@@ -678,6 +709,7 @@ function TimetableWorkbench() {
   const slotLoads = getSlotLoads(assignment);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
   const activeCourse = activeCourseId ? COURSE_MAP[activeCourseId] : null;
+  const totalPlannerPopulation = Object.values(GROUPS).reduce((sum, group) => sum + group.count, 0);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -691,8 +723,27 @@ function TimetableWorkbench() {
     return () => window.clearTimeout(timer);
   }, [gridPulse]);
 
-  function updateWeight(key, value) {
-    setWeights((current) => ({ ...current, [key]: Number(value) }));
+  function updateTermWeight(termId, value) {
+    setModelSpec((current) => ({
+      ...current,
+      terms: current.terms.map((t) => t.id === termId ? { ...t, weight: Number(value) } : t),
+    }));
+  }
+
+  function addTerm(termId) {
+    const lib = TERM_LIBRARY[termId];
+    if (!lib) return;
+    setModelSpec((current) => {
+      if (current.terms.some((t) => t.id === termId)) return current;
+      return { ...current, terms: [...current.terms, { id: termId, weight: lib.defaultWeight }] };
+    });
+  }
+
+  function removeTerm(termId) {
+    setModelSpec((current) => ({
+      ...current,
+      terms: current.terms.filter((t) => t.id !== termId),
+    }));
   }
 
   function updateConstraint(key, value) {
@@ -713,7 +764,7 @@ function TimetableWorkbench() {
     window.setTimeout(() => {
       const result = solveTimetable({
         students,
-        weights,
+        modelSpec,
         constraints,
         seed,
         restarts: 10,
@@ -740,7 +791,7 @@ function TimetableWorkbench() {
   function handleLoadOptimal() {
     if (isSolving) return;
     applySolvedAssignment(PRECOMPUTED_OPTIMAL_ASSIGNMENT);
-    setWeights({ ...TRUE_WEIGHTS });
+    setModelSpec({ terms: TRUE_SPEC.terms.map((t) => ({ ...t })) });
     setConstraints({ ...DEFAULT_CONSTRAINTS });
     setSolveSummary("Loaded the saved reference timetable.");
     setToast(`Loaded saved reference (F_ref = ${formatNumber(optimalMetrics.trueScore)})`);
@@ -749,7 +800,7 @@ function TimetableWorkbench() {
   function handleReset() {
     setAssignment(createEmptyAssignment());
     setGridVersion((current) => current + 1);
-    setWeights(DEFAULT_WEIGHTS);
+    setModelSpec({ terms: DEFAULT_MODEL_SPEC.terms.map((t) => ({ ...t })) });
     setConstraints({ ...DEFAULT_CONSTRAINTS });
     setRound(1);
     setSolveSummary("No solve run yet.");
@@ -842,6 +893,18 @@ function TimetableWorkbench() {
 
         <div style={{ display: "grid", gridTemplateColumns: "290px minmax(820px, 1fr) 520px", gap: 14, alignItems: "stretch" }}>
           <aside style={{ display: "grid", gap: 14, height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+            <SectionCard title="Population Overview">
+              {Object.entries(GROUPS).map(([group, config]) => (
+                <div key={group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                  <span>{config.label}</span>
+                  <span>{config.count} ({formatNumber((config.count / totalPlannerPopulation) * 100)}%)</span>
+                </div>
+              ))}
+              <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>
+                This composition is public to the planner. What remains hidden is the exact welfare mapping from schedules to outcomes.
+              </div>
+            </SectionCard>
+
             <SectionCard title="Student Voices">
               {VOICES.map((voice) => (
                 <div
@@ -1054,29 +1117,76 @@ function TimetableWorkbench() {
                   <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>{solveSummary}</div>
                 </div>
 
-                {[
-                  ["coverage", "coverage"],
-                  ["timePenalty", "time penalty"],
-                  ["compactnessPenalty", "compactness"],
-                  ["fridayBonus", "friday bonus"],
-                ].map(([key, label]) => (
-                  <label key={key} style={{ display: "grid", gap: 4 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
-                      <span>{label}</span>
-                      <strong>{weights[key]}</strong>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="12"
-                      step="0.5"
-                      value={weights[key]}
-                      onChange={(event) => updateWeight(key, event.target.value)}
-                    />
-                  </label>
-                ))}
+                <div style={{ fontSize: 12, fontWeight: 700, marginTop: 4 }}>Model Inspector</div>
 
-                <div style={{ fontSize: 12, fontWeight: 700, marginTop: 6 }}>Simple Constraints</div>
+                <div style={panelStyle({ padding: 10, background: "#f8fafb", fontFamily: "monospace", fontSize: 11, lineHeight: 1.8, wordBreak: "break-word" })}>
+                  <div style={{ color: COLORS.muted, marginBottom: 2 }}>F(x) = Σ_s [</div>
+                  {modelSpec.terms.map((term, i) => {
+                    const lib = TERM_LIBRARY[term.id];
+                    const sign = lib.sign === +1 ? (i === 0 ? "  " : "+ ") : "− ";
+                    return (
+                      <div key={term.id} style={{ paddingLeft: 12 }}>
+                        {sign}<strong>{term.weight}</strong> × {lib.label}
+                      </div>
+                    );
+                  })}
+                  <div style={{ color: COLORS.muted }}>]</div>
+                </div>
+
+                {modelSpec.terms.map((term) => {
+                  const lib = TERM_LIBRARY[term.id];
+                  return (
+                    <label key={term.id} style={{ display: "grid", gap: 3 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11 }}>
+                        <span style={{ color: COLORS.muted }}>{lib.label}</span>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <strong>{term.weight}</strong>
+                          {term.id !== "coverage" && (
+                            <button
+                              className="app-button ghost"
+                              style={{ fontSize: 10, padding: "1px 5px", lineHeight: 1.4 }}
+                              onClick={() => removeTerm(term.id)}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="12"
+                        step="0.5"
+                        value={term.weight}
+                        onChange={(event) => updateTermWeight(term.id, event.target.value)}
+                      />
+                    </label>
+                  );
+                })}
+
+                {(() => {
+                  const activeIds = new Set(modelSpec.terms.map((t) => t.id));
+                  const inactive = Object.keys(TERM_LIBRARY).filter((id) => !activeIds.has(id));
+                  if (inactive.length === 0) return null;
+                  return (
+                    <div style={{ display: "grid", gap: 5 }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.muted }}>Add a term</div>
+                      {inactive.map((termId) => (
+                        <button
+                          key={termId}
+                          className="app-button secondary"
+                          style={{ fontSize: 11, textAlign: "left" }}
+                          onClick={() => addTerm(termId)}
+                          title={TERM_LIBRARY[termId].description}
+                        >
+                          + {TERM_LIBRARY[termId].label}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })()}
+
+                <div style={{ fontSize: 12, fontWeight: 700, marginTop: 4 }}>Constraints</div>
 
                 <label className="check-row compact">
                   <input
@@ -1095,10 +1205,6 @@ function TimetableWorkbench() {
                   />
                   <span>Favor Friday-free schedules</span>
                 </label>
-
-                <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>
-                  This simplified version keeps only the controls that map cleanly onto the writeup: coverage, time, compactness, and a hidden Friday preference.
-                </div>
 
                 {currentMetrics.violations.length ? (
                   <div style={{ display: "grid", gap: 6, fontSize: 11, color: COLORS.danger }}>
@@ -1187,27 +1293,33 @@ function TimetableWorkbench() {
 
             <div style={panelStyle({ padding: 14, background: "#fbfcfd" })}>
               <code style={{ fontSize: 13 }}>
-                U_s(x) = 10 * coverage - 2 * time_penalty - 2.5 * compactness_penalty + 1 * friday_bonus
+                U_g(x) = AvgStudentUtility_g(x)
               </code>
               <div style={{ marginTop: 10 }}>
-                <code style={{ fontSize: 13 }}>F(x) = \u2211_s U_s(x)</code>
+                <code style={{ fontSize: 13 }}>F(x) = \u2211_g p_g U_g(x)</code>
+              </div>
+              <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}>
+                <strong>AvgStudentUtility_g(x)</strong> is the average student-level utility in group <code>g</code>, where student utility is computed as
+                <br />
+                <code>10 * coverage - 2 * time_penalty - 2.5 * compactness_penalty + 1 * friday_bonus</code>.
+                <br />
+                <strong>p_g</strong> is the public population share of each group.
               </div>
             </div>
 
             <div style={{ fontSize: 13, lineHeight: 1.55 }}>
-              This simplified prototype keeps the writeup's core logic. Coverage captures conflict management, time penalties capture direct stakeholder interpretation, compactness captures commuter fragmentation and campus-day burden, and the hidden Friday bonus remains the main discovery element.
+              This simplified prototype keeps the writeup's core logic. The subgroup composition is public to the planner; what remains hidden is the exact welfare mapping, the strength of tradeoffs, and the Friday bonus.
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1.15fr 1fr", gap: 14 }}>
               <div style={panelStyle({ padding: 12 })}>
                 <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>True Group Mix</div>
                 {Object.entries(GROUPS).map(([group, config]) => {
-                  const total = Object.values(GROUPS).reduce((sum, entry) => sum + entry.count, 0);
                   return (
                     <div key={group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 6 }}>
                       <span>{config.label}</span>
                       <span>
-                        {config.count} students ({formatNumber((config.count / total) * 100)}%)
+                        {config.count} students ({formatNumber((config.count / totalPlannerPopulation) * 100)}%)
                       </span>
                     </div>
                   );
@@ -1292,7 +1404,7 @@ function TimetableWorkbench() {
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
                 <strong style={{ fontSize: 12 }}>Interpretation</strong>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The student voices use ordinary language rather than parameter names. Commuters imply compact schedules, workers imply strong afternoon aversion, and athletes imply a narrow MWF-morning issue. The participant has to translate those statements into model changes.
+                  The student voices use ordinary language rather than parameter names. The planner already knows the subgroup mix; the challenge is translating narrative language into the right model changes.
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
@@ -1378,21 +1490,21 @@ function TimetableWorkbench() {
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
-                <strong style={{ fontSize: 12 }}>What the sliders do</strong>
+                <strong style={{ fontSize: 12 }}>What the model spec does</strong>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The solver scores candidate timetables with a surrogate objective of the form <code>coverage weight * total coverage - time weight * total time penalty - compactness weight * total compactness penalty + friday weight * total friday bonus</code>.
+                  The solver scores candidate timetables using the active terms in the Model Inspector. Each term has a weight; the surrogate objective is the weighted sum across all students. Adding a term makes the solver start optimizing for it.
                 </div>
                 <div style={{ fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
-                  <strong>Coverage</strong>: makes the solver care more about avoiding collisions among demanded courses, especially for high-demand classes.
+                  <strong>Course coverage</strong>: avoids collisions among demanded courses — the primary driver of student welfare.
                 </div>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  <strong>Time penalty</strong>: makes the solver care more about group-specific disliked times, especially worker afternoons and athlete MWF mornings.
+                  <strong>Time-of-day penalty</strong>: penalizes group-specific disliked times — worker afternoons, athlete MWF mornings, commuter mornings (mild).
                 </div>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  <strong>Compactness</strong>: makes the solver care more about reducing extra campus days and single-block days, with the strongest effect on commuters.
+                  <strong>Campus day compactness</strong>: reduces extra campus days and isolated single-block days, strongest effect on commuters.
                 </div>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  <strong>Friday bonus</strong>: rewards timetables that leave more students with no Friday classes. In the participant-facing surrogate this can be set to zero, even though the hidden true objective includes it.
+                  <strong>Friday-free bonus</strong>: rewards timetables that leave more students with no Friday classes. Not in the starting model — must be discovered.
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
@@ -1849,6 +1961,7 @@ function ResourceWorkbench() {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
   const activeProject = activeProjectId ? RESOURCE_PROJECT_MAP[activeProjectId] : null;
   const resourceBars = Object.values(metrics.perGroup).map((entry) => ({ name: entry.label, value: entry.avgUtility, color: entry.color }));
+  const totalResourcePopulation = Object.values(RESOURCE_GROUPS).reduce((sum, group) => sum + group.count, 0);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -1888,6 +2001,18 @@ function ResourceWorkbench() {
 
       <div style={{ display: "grid", gridTemplateColumns: "290px minmax(820px, 1fr) 520px", gap: 14, alignItems: "stretch" }}>
         <aside style={{ display: "grid", gap: 14, height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+          <SectionCard title="Population Overview">
+            {Object.entries(RESOURCE_GROUPS).map(([group, config]) => (
+              <div key={group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{config.label}</span>
+                <span>{config.count} ({formatNumber((config.count / totalResourcePopulation) * 100)}%)</span>
+              </div>
+            ))}
+            <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>
+              These stakeholder proportions are public. The hidden part is the exact welfare function and the reserve-quarter bonus.
+            </div>
+          </SectionCard>
+
           <SectionCard title="Stakeholder Voices">
             {RESOURCE_VOICES.map((voice) => (
               <div key={voice.id} style={{ borderLeft: `4px solid ${RESOURCE_GROUPS[voice.group].color}`, borderRadius: 12, background: "#fbfcfd", padding: 12, display: "grid", gap: 8 }}>
@@ -1970,7 +2095,7 @@ function ResourceWorkbench() {
                   <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber(metrics.trueScore)}</div>
                 </div>
                 <div style={panelStyle({ padding: 12, borderColor: COLORS.success })}>
-                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>% of Reference</div>
+                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>% of Saved Reference</div>
                   <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber((metrics.trueScore / optimalMetrics.trueScore) * 100)}%</div>
                 </div>
               </div>
@@ -2032,7 +2157,7 @@ function ResourceWorkbench() {
 
       <footer style={panelStyle({ padding: "12px 16px", display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 13 })}>
         <span>Current F(x) = {formatNumber(metrics.trueScore)}</span>
-        <span>Reference F(x_ref) = {formatNumber(optimalMetrics.trueScore)}</span>
+        <span>Saved reference F(x_ref) = {formatNumber(optimalMetrics.trueScore)}</span>
         <span>Gap to reference = {formatNumber(((optimalMetrics.trueScore - metrics.trueScore) / optimalMetrics.trueScore) * 100)}%</span>
         <span>Round {round}</span>
       </footer>
@@ -2047,11 +2172,19 @@ function ResourceWorkbench() {
               <button className="app-button secondary" onClick={() => setShowUtilityModal(false)}>Close</button>
             </div>
             <div style={panelStyle({ padding: 14, background: "#fbfcfd" })}>
-              <code style={{ fontSize: 13 }}>U_g(x) = 10 * coverage - 2.2 * timing_penalty - 2.4 * spread_penalty + 1 * reserve_bonus</code>
-              <div style={{ marginTop: 10 }}><code style={{ fontSize: 13 }}>F(x) = \u2211_g U_g(x)</code></div>
+              <code style={{ fontSize: 13 }}>F(x) = 10 * Coverage(x) - 2.2 * TimingPenalty(x) - 2.4 * SpreadPenalty(x) + 1 * ReserveBonus(x)</code>
+              <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}>
+                <strong>Coverage(x)</strong> is the population-weighted share of desired projects funded without quarter collisions.
+                <br />
+                <strong>TimingPenalty(x)</strong> captures mismatch between project timing and each group's preferred phase.
+                <br />
+                <strong>SpreadPenalty(x)</strong> penalizes fragmenting a group's portfolio across too many quarters.
+                <br />
+                <strong>ReserveBonus(x)</strong> rewards keeping projects out of the reserve quarter.
+              </div>
             </div>
             <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-              This alternate interface preserves the same basic cognitive structure as the timetable experiment. Coverage captures whether each group's desired projects are funded without quarter collisions, timing penalties capture phase preferences, spread penalties capture implementation fragmentation, and the hidden reserve bonus rewards staying out of the reserve quarter.
+              This alternate interface preserves the same basic cognitive structure as the timetable experiment. The stakeholder composition is public to the planner. What remains hidden is the exact welfare mapping: coverage captures whether each group's desired projects are funded without quarter collisions, timing penalties capture phase preferences, spread penalties capture implementation fragmentation, and the hidden reserve bonus rewards staying out of the reserve quarter.
             </div>
           </div>
         </div>
@@ -2065,7 +2198,7 @@ function ResourceWorkbench() {
               <button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button>
             </div>
             <div style={{ display: "grid", gap: 10 }}>
-              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Voices use portfolio language like “move early,” “avoid fragmentation,” and “later is fine,” which still must be translated into concrete model weights.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Voices use portfolio language like “move early,” “avoid fragmentation,” and “later is fine.” The stakeholder mix is visible; the challenge is mapping those statements into the right model weights.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Budget, equity, and implementation concerns intentionally pull in different directions so the participant has to balance them rather than optimize a single spoken value.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The dashboard is built to expose subgroup harm, demand conflicts, and reserve usage rather than revealing the objective directly.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden structure is that leaving projects out of the reserve quarter is globally rewarded even when stakeholders never say that outright.</div></div>
@@ -2093,6 +2226,849 @@ function ResourceWorkbench() {
   );
 }
 
+const BUDGET_TOTAL = 100;
+const BUDGET_STEP = 5;
+const BUDGET_GROUPS = {
+  households: { label: "Households", short: "Households", icon: "H", color: "#d97a5a", count: 42 },
+  services: { label: "City Services", short: "Services", icon: "S", color: "#5f8f7b", count: 33 },
+  growth: { label: "Future Growth", short: "Growth", icon: "G", color: "#5c6b94", count: 25 },
+};
+const BUDGET_PROGRAMS = [
+  { id: "B1", name: "Housing Relief", target: 20, impact: { households: 1.2, services: 0.2, growth: 0.1 }, essential: true },
+  { id: "B2", name: "Transit Access", target: 15, impact: { households: 0.9, services: 0.6, growth: 0.4 }, essential: false },
+  { id: "B3", name: "Maintenance", target: 15, impact: { households: 0.2, services: 1.1, growth: 0.2 }, essential: true },
+  { id: "B4", name: "Digital Systems", target: 10, impact: { households: 0.1, services: 0.9, growth: 0.7 }, essential: false },
+  { id: "B5", name: "Small Business Fund", target: 15, impact: { households: 0.3, services: 0.2, growth: 1.1 }, essential: false },
+  { id: "B6", name: "Climate Resilience", target: 10, impact: { households: 0.5, services: 0.4, growth: 0.8 }, essential: false },
+  { id: "B7", name: "Youth Programs", target: 10, impact: { households: 1.0, services: 0.1, growth: 0.2 }, essential: false },
+  { id: "B8", name: "Contingency Reserve", target: 5, impact: { households: 0, services: 0, growth: 0 }, essential: false, reserve: true },
+];
+const BUDGET_VOICES = [
+  { id: "bv1", title: "Resident Coalition", color: BUDGET_GROUPS.households.color, text: "Visible support matters. If household-facing programs get squeezed to protect internal systems, people will feel the budget ignored them." },
+  { id: "bv2", title: "Operations Chief", color: BUDGET_GROUPS.services.color, text: "Spreading too little across too many maintenance programs is how cities end up with service failures. Stability needs real dollars, not symbolic dollars." },
+  { id: "bv3", title: "Economic Strategy Team", color: BUDGET_GROUPS.growth.color, text: "Some investments do not need to go first, but they do need enough scale to matter. Tiny innovation budgets look balanced and accomplish nothing." },
+];
+const BUDGET_BRIEFINGS = [
+  { id: "bb1", title: "Budget Office", role: "Coverage", text: "High-demand programs should not be visibly starved. The budget should read as responsive to need." },
+  { id: "bb2", title: "Equity Board", role: "Prioritization", text: "Residents will carry the cost if household programs are treated as optional compared with internal infrastructure." },
+  { id: "bb3", title: "City Manager", role: "Diagnosis", text: "A budget can look balanced in aggregate while one part of the city is left carrying risk. The subgroup view matters." },
+];
+const BUDGET_TRUE_WEIGHTS = { coverage: 10, equityPenalty: 2.4, stabilityPenalty: 2.2, reserveBonus: 1 };
+const BUDGET_DEFAULT_WEIGHTS = { coverage: 10, equityPenalty: 2.4, stabilityPenalty: 2.2, reserveBonus: 0 };
+const BUDGET_DEFAULT_CONSTRAINTS = { protectEssentials: false, minimumReserve: false };
+
+function createEmptyBudgetAllocation() {
+  return Object.fromEntries(BUDGET_PROGRAMS.map((program) => [program.id, 0]));
+}
+
+function sumBudget(allocation) {
+  return Object.values(allocation).reduce((sum, value) => sum + value, 0);
+}
+
+function evaluateBudgetAllocation(allocation, weights = BUDGET_DEFAULT_WEIGHTS, constraints = BUDGET_DEFAULT_CONSTRAINTS) {
+  const totalPopulation = Object.values(BUDGET_GROUPS).reduce((sum, group) => sum + group.count, 0);
+  const achievedByGroup = Object.fromEntries(Object.keys(BUDGET_GROUPS).map((group) => [group, 0]));
+  const coverageTargets = Object.fromEntries(Object.keys(BUDGET_GROUPS).map((group) => [group, 0]));
+  let stabilityShortfall = 0;
+  let reserveBonus = 0;
+
+  BUDGET_PROGRAMS.forEach((program) => {
+    const allocationFraction = Math.min((allocation[program.id] ?? 0) / program.target, 1);
+    Object.entries(program.impact).forEach(([group, value]) => {
+      achievedByGroup[group] += allocationFraction * value;
+      coverageTargets[group] += value;
+    });
+    if (program.essential) {
+      stabilityShortfall += Math.max(0, 1 - allocationFraction);
+    }
+    if (program.reserve && (allocation[program.id] ?? 0) >= 10) {
+      reserveBonus = 1;
+    }
+  });
+
+  const perGroup = Object.fromEntries(
+    Object.entries(BUDGET_GROUPS).map(([group, config]) => {
+      const achieved = coverageTargets[group] === 0 ? 0 : achievedByGroup[group] / coverageTargets[group];
+      return [
+        group,
+        {
+          group,
+          label: config.label,
+          color: config.color,
+          achieved,
+          weightedAchieved: achieved * config.count,
+        },
+      ];
+    })
+  );
+
+  const coverage = Object.values(perGroup).reduce((sum, entry) => sum + entry.weightedAchieved, 0) / totalPopulation;
+  const groupAchievedValues = Object.values(perGroup).map((entry) => entry.achieved);
+  const avgAchieved = groupAchievedValues.reduce((sum, value) => sum + value, 0) / groupAchievedValues.length;
+  const equityPenalty = groupAchievedValues.reduce((sum, value) => sum + Math.abs(value - avgAchieved), 0) / groupAchievedValues.length;
+
+  Object.values(perGroup).forEach((entry) => {
+    entry.avgUtility =
+      BUDGET_TRUE_WEIGHTS.coverage * entry.achieved -
+      BUDGET_TRUE_WEIGHTS.equityPenalty * Math.abs(entry.achieved - avgAchieved) -
+      BUDGET_TRUE_WEIGHTS.stabilityPenalty * (stabilityShortfall / 2.5) +
+      BUDGET_TRUE_WEIGHTS.reserveBonus * reserveBonus;
+  });
+
+  const surrogateScore =
+    weights.coverage * coverage -
+    weights.equityPenalty * equityPenalty -
+    weights.stabilityPenalty * stabilityShortfall +
+    weights.reserveBonus * reserveBonus;
+  const trueScore =
+    BUDGET_TRUE_WEIGHTS.coverage * coverage -
+    BUDGET_TRUE_WEIGHTS.equityPenalty * equityPenalty -
+    BUDGET_TRUE_WEIGHTS.stabilityPenalty * stabilityShortfall +
+    BUDGET_TRUE_WEIGHTS.reserveBonus * reserveBonus;
+
+  const violations = [];
+  if (sumBudget(allocation) > BUDGET_TOTAL) violations.push("Budget exceeds total limit");
+  if (constraints.protectEssentials) {
+    const essentialsTooLow = BUDGET_PROGRAMS.filter((program) => program.essential && (allocation[program.id] ?? 0) < program.target * 0.8);
+    if (essentialsTooLow.length) violations.push("Essential programs are underfunded");
+  }
+  if (constraints.minimumReserve && (allocation.B8 ?? 0) < 10) {
+    violations.push("Reserve is below the target level");
+  }
+
+  return {
+    trueScore,
+    surrogateScore,
+    penalizedSurrogate: surrogateScore - violations.length * 100000,
+    perGroup,
+    coverage,
+    equityPenalty,
+    stabilityShortfall,
+    reserveBonus,
+    remainingBudget: BUDGET_TOTAL - sumBudget(allocation),
+    violations,
+  };
+}
+
+function solveBudgetAllocation(weights, constraints, seed) {
+  const rng = createRng(seed);
+  let current = createEmptyBudgetAllocation();
+  BUDGET_PROGRAMS.forEach((program) => {
+    const baseline = program.reserve ? 0 : program.target;
+    current[program.id] = Math.min(baseline, BUDGET_TOTAL - sumBudget(current));
+  });
+  while (sumBudget(current) > BUDGET_TOTAL) {
+    const randomProgram = BUDGET_PROGRAMS[Math.floor(rng() * BUDGET_PROGRAMS.length)];
+    if ((current[randomProgram.id] ?? 0) >= BUDGET_STEP) current[randomProgram.id] -= BUDGET_STEP;
+  }
+  let currentMetrics = evaluateBudgetAllocation(current, weights, constraints);
+  let best = { allocation: { ...current }, metrics: currentMetrics };
+
+  for (let step = 0; step < 7000; step += 1) {
+    const next = { ...current };
+    const from = BUDGET_PROGRAMS[Math.floor(rng() * BUDGET_PROGRAMS.length)];
+    const to = BUDGET_PROGRAMS[Math.floor(rng() * BUDGET_PROGRAMS.length)];
+    if (from.id === to.id) continue;
+    if ((next[from.id] ?? 0) < BUDGET_STEP) continue;
+    next[from.id] -= BUDGET_STEP;
+    next[to.id] += BUDGET_STEP;
+    const nextMetrics = evaluateBudgetAllocation(next, weights, constraints);
+    if (nextMetrics.penalizedSurrogate > currentMetrics.penalizedSurrogate || rng() < 0.02) {
+      current = next;
+      currentMetrics = nextMetrics;
+      if (nextMetrics.penalizedSurrogate > best.metrics.penalizedSurrogate) {
+        best = { allocation: { ...next }, metrics: nextMetrics };
+      }
+    }
+  }
+
+  return best;
+}
+
+function BudgetWorkbench() {
+  const [round, setRound] = useState(1);
+  const [allocation, setAllocation] = useState({
+    B1: 20, B2: 10, B3: 15, B4: 10, B5: 15, B6: 10, B7: 10, B8: 10,
+  });
+  const [weights, setWeights] = useState(BUDGET_DEFAULT_WEIGHTS);
+  const [constraints, setConstraints] = useState({ ...BUDGET_DEFAULT_CONSTRAINTS });
+  const [solverSeed, setSolverSeed] = useState(333);
+  const [toast, setToast] = useState("");
+  const [showUtilityModal, setShowUtilityModal] = useState(false);
+  const [showDesignModal, setShowDesignModal] = useState(false);
+  const [showSolverModal, setShowSolverModal] = useState(false);
+  const [isSolving, setIsSolving] = useState(false);
+  const [solveSummary, setSolveSummary] = useState("No solve run yet.");
+  const metrics = useMemo(() => evaluateBudgetAllocation(allocation, weights, constraints), [allocation, weights, constraints]);
+  const savedReference = useMemo(() => solveBudgetAllocation(BUDGET_TRUE_WEIGHTS, BUDGET_DEFAULT_CONSTRAINTS, 901), []);
+  const totalPopulation = Object.values(BUDGET_GROUPS).reduce((sum, group) => sum + group.count, 0);
+
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timer = window.setTimeout(() => setToast(""), 2200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  function updateProgram(programId, nextValue) {
+    const parsed = Number(nextValue);
+    if (Number.isNaN(parsed)) return;
+    setAllocation((current) => ({ ...current, [programId]: Math.max(0, Math.min(BUDGET_TOTAL, parsed)) }));
+  }
+
+  function runSolve(seed, randomize) {
+    if (isSolving) return;
+    setIsSolving(true);
+    setSolveSummary("Searching budget allocations...");
+    window.setTimeout(() => {
+      const result = solveBudgetAllocation(weights, constraints, seed);
+      setAllocation(result.allocation);
+      setSolveSummary(result.metrics.violations.length ? "Loaded best budget with warnings." : "Budget solution loaded.");
+      setToast(result.metrics.violations.length ? "Solved with warnings." : "Budget solved.");
+      if (randomize) setSolverSeed((current) => current + 17);
+      setIsSolving(false);
+    }, 40);
+  }
+
+  const groupBars = Object.values(metrics.perGroup).map((entry) => ({ name: entry.label, value: entry.avgUtility, color: entry.color }));
+
+  return (
+    <div style={{ display: "grid", gap: 14, maxWidth: 1660, minWidth: 1540, margin: "0 auto" }}>
+      <header style={panelStyle({ padding: 16, display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" })}>
+        <div>
+          <div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.1em", textTransform: "uppercase" }}>Alternate Context</div>
+          <h1 style={{ margin: "4px 0 0", fontSize: 28 }}>Budget Allocation Experiment Workbench</h1>
+          <div style={{ color: COLORS.muted, fontSize: 13, marginTop: 4 }}>A continuous budget setting with the same four-dimension logic as the timetable interface.</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 12, background: COLORS.accentSoft }}>
+            <span style={{ fontSize: 12, color: COLORS.muted }}>Round</span>
+            <button className="app-button ghost" onClick={() => setRound((value) => Math.max(1, value - 1))}>-</button>
+            <strong>{round}</strong>
+            <button className="app-button ghost" onClick={() => setRound((value) => value + 1)}>+</button>
+          </div>
+          <button className="app-button secondary" onClick={() => setShowUtilityModal(true)}>Show True Utility</button>
+          <button className="app-button secondary" onClick={() => setShowDesignModal(true)}>Design Intent</button>
+          <button className="app-button secondary" onClick={() => setShowSolverModal(true)}>How Solver Works</button>
+          <button className="app-button secondary" onClick={() => {
+            setAllocation({ B1: 20, B2: 10, B3: 15, B4: 10, B5: 15, B6: 10, B7: 10, B8: 10 });
+            setWeights(BUDGET_DEFAULT_WEIGHTS);
+            setConstraints({ ...BUDGET_DEFAULT_CONSTRAINTS });
+            setRound(1);
+            setToast("Reset to baseline budget.");
+          }}>Reset</button>
+        </div>
+      </header>
+
+      <div style={{ display: "grid", gridTemplateColumns: "290px minmax(820px, 1fr) 520px", gap: 14, alignItems: "stretch" }}>
+        <aside style={{ display: "grid", gap: 14, height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+          <SectionCard title="Population Overview">
+            {Object.entries(BUDGET_GROUPS).map(([group, config]) => (
+              <div key={group} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{config.label}</span>
+                <span>{config.count} ({formatNumber((config.count / totalPopulation) * 100)}%)</span>
+              </div>
+            ))}
+            <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>
+              The stakeholder mix is public. The hidden part is the exact welfare mapping from dollars to outcomes.
+            </div>
+          </SectionCard>
+          <SectionCard title="Stakeholder Voices">
+            {BUDGET_VOICES.map((voice) => (
+              <div key={voice.id} style={{ borderLeft: `4px solid ${voice.color}`, borderRadius: 12, background: "#fbfcfd", padding: 12, display: "grid", gap: 8 }}>
+                <strong style={{ fontSize: 12 }}>{voice.title}</strong>
+                <div style={{ fontSize: 12, lineHeight: 1.45 }}>{voice.text}</div>
+              </div>
+            ))}
+          </SectionCard>
+          <SectionCard title="Budget Briefings">
+            {BUDGET_BRIEFINGS.map((briefing) => (
+              <div key={briefing.id} style={{ borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: 12, display: "grid", gap: 8 }}>
+                <div>
+                  <strong style={{ fontSize: 12 }}>{briefing.title}</strong>
+                  <div style={{ color: COLORS.muted, fontSize: 11 }}>{briefing.role}</div>
+                </div>
+                <div style={{ fontSize: 12, lineHeight: 1.45 }}>{briefing.text}</div>
+              </div>
+            ))}
+          </SectionCard>
+        </aside>
+
+        <main style={{ display: "grid", gap: 14 }}>
+          <section style={panelStyle({ padding: 16, display: "grid", gap: 14 })}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Budget Editor</div>
+                <div style={{ fontSize: 13 }}>Allocate the fixed budget across programs. The total should stay at or below {BUDGET_TOTAL}.</div>
+              </div>
+              <div style={{ fontSize: 12, color: metrics.remainingBudget < 0 ? COLORS.danger : COLORS.success }}>
+                Remaining budget: {formatNumber(metrics.remainingBudget)}
+              </div>
+            </div>
+            {isSolving ? (
+              <div style={{ borderRadius: 12, background: "#eef5f6", border: `1px solid ${COLORS.border}`, padding: "10px 12px", display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                <div className="solver-spinner" />
+                <span>Solver is searching and will load the best budget directly into these controls.</span>
+              </div>
+            ) : null}
+            <div style={{ display: "grid", gap: 12 }}>
+              {BUDGET_PROGRAMS.map((program) => (
+                <div key={program.id} style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+                    <div>
+                      <strong style={{ fontSize: 13 }}>{program.id} {program.name}</strong>
+                      <div style={{ fontSize: 11, color: COLORS.muted }}>Target {program.target}{program.reserve ? " | hidden reserve feature" : program.essential ? " | essential" : ""}</div>
+                    </div>
+                    <strong>{allocation[program.id]}</strong>
+                  </div>
+                  <input type="range" min="0" max={40} step={BUDGET_STEP} value={allocation[program.id]} onChange={(event) => updateProgram(program.id, event.target.value)} />
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 8, fontSize: 11 }}>
+                    <span style={{ color: BUDGET_GROUPS.households.color }}>Households {program.impact.households}</span>
+                    <span style={{ color: BUDGET_GROUPS.services.color }}>Services {program.impact.services}</span>
+                    <span style={{ color: BUDGET_GROUPS.growth.color }}>Growth {program.impact.growth}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </main>
+
+        <aside style={{ display: "grid", height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 220px", gap: 14, alignItems: "start" }}>
+            <SectionCard title="Metrics">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div style={panelStyle({ padding: 12 })}>
+                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Current F(x)</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber(metrics.trueScore)}</div>
+                </div>
+                <div style={panelStyle({ padding: 12, borderColor: COLORS.success })}>
+                  <div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>% of Saved Reference</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber((metrics.trueScore / savedReference.metrics.trueScore) * 100)}%</div>
+                </div>
+              </div>
+              <div style={{ height: 170 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Average Utility by Group</div>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={groupBars} layout="vertical" margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#edf0f2" />
+                    <XAxis type="number" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="name" width={80} tick={{ fontSize: 11 }} />
+                    <Tooltip formatter={(value) => formatNumber(value)} />
+                    <Bar dataKey="value" radius={[0, 8, 8, 0]}>
+                      {groupBars.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div style={{ display: "grid", gap: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 700 }}>Budget Summary</div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Coverage</span><span>{formatNumber(metrics.coverage * 100)}%</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Equity penalty</span><span>{formatNumber(metrics.equityPenalty, 2)}</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Stability shortfall</span><span>{formatNumber(metrics.stabilityShortfall, 2)}</span></div>
+              </div>
+            </SectionCard>
+            <SectionCard title="Solver">
+              <button className="app-button primary" onClick={() => runSolve(solverSeed, false)} disabled={isSolving}>{isSolving ? "Solving..." : "Solve"}</button>
+              <button className="app-button secondary" onClick={() => runSolve(solverSeed + 31, true)} disabled={isSolving}>{isSolving ? "Working..." : "Re-solve"}</button>
+              <button className="app-button secondary" onClick={() => {
+                setAllocation(savedReference.allocation);
+                setWeights({ ...BUDGET_TRUE_WEIGHTS });
+                setConstraints({ ...BUDGET_DEFAULT_CONSTRAINTS });
+                setSolveSummary("Loaded the saved reference budget.");
+              }} disabled={isSolving}>Load Saved Reference</button>
+              <div style={panelStyle({ padding: 10, background: "#fbfcfd" })}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <div className={isSolving ? "solver-spinner" : "solver-spinner idle"} />
+                  <strong style={{ fontSize: 12 }}>{isSolving ? "Solver running" : "Solver status"}</strong>
+                </div>
+                <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>{solveSummary}</div>
+              </div>
+              {[
+                ["coverage", "coverage"],
+                ["equityPenalty", "equity penalty"],
+                ["stabilityPenalty", "stability"],
+                ["reserveBonus", "reserve bonus"],
+              ].map(([key, label]) => (
+                <label key={key} style={{ display: "grid", gap: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>{label}</span><strong>{weights[key]}</strong></div>
+                  <input type="range" min="0" max="12" step="0.5" value={weights[key]} onChange={(event) => setWeights((current) => ({ ...current, [key]: Number(event.target.value) }))} />
+                </label>
+              ))}
+              <div style={{ fontSize: 12, fontWeight: 700, marginTop: 6 }}>Simple Constraints</div>
+              <label className="check-row compact"><input type="checkbox" checked={constraints.protectEssentials} onChange={(event) => setConstraints((current) => ({ ...current, protectEssentials: event.target.checked }))} /><span>Protect essential programs</span></label>
+              <label className="check-row compact"><input type="checkbox" checked={constraints.minimumReserve} onChange={(event) => setConstraints((current) => ({ ...current, minimumReserve: event.target.checked }))} /><span>Maintain minimum reserve</span></label>
+            </SectionCard>
+          </div>
+        </aside>
+      </div>
+
+      <footer style={panelStyle({ padding: "12px 16px", display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 13 })}>
+        <span>Current F(x) = {formatNumber(metrics.trueScore)}</span>
+        <span>Saved reference F(x_ref) = {formatNumber(savedReference.metrics.trueScore)}</span>
+        <span>Gap to reference = {formatNumber(((savedReference.metrics.trueScore - metrics.trueScore) / savedReference.metrics.trueScore) * 100)}%</span>
+        <span>Round {round}</span>
+      </footer>
+
+      {toast ? <div style={{ position: "fixed", top: 18, right: 18, background: COLORS.accent, color: "#fff", borderRadius: 12, padding: "10px 14px", fontSize: 12, boxShadow: "0 14px 30px rgba(39, 76, 87, 0.24)" }}>{toast}</div> : null}
+
+      {showUtilityModal ? (
+        <div onClick={() => setShowUtilityModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}>
+          <div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}>
+              <div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Hidden Objective</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>Budget Allocation True Utility</h2></div>
+              <button className="app-button secondary" onClick={() => setShowUtilityModal(false)}>Close</button>
+            </div>
+            <div style={panelStyle({ padding: 14, background: "#fbfcfd" })}>
+              <code style={{ fontSize: 13 }}>U_g(x) = 10 * Benefit_g(x) - 2.4 * EquityGap_g(x) - 2.2 * StabilityBurden_g(x) + 1 * ReserveBenefit_g(x)</code>
+              <div style={{ marginTop: 10 }}><code style={{ fontSize: 13 }}>F(x) = \u2211_g p_g U_g(x)</code></div>
+              <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}>
+                <strong>Benefit_g(x)</strong> is the share of that group's desired budget impact that is delivered.
+                <br />
+                <strong>EquityGap_g(x)</strong> measures how far that group's benefit falls from the overall average.
+                <br />
+                <strong>StabilityBurden_g(x)</strong> reflects underfunding of essential programs that hurts all groups.
+                <br />
+                <strong>ReserveBenefit_g(x)</strong> reflects the common value of maintaining a stronger reserve.
+              </div>
+            </div>
+            <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+              The planner knows the stakeholder proportions. What remains hidden is how strongly inequity, stability shortfalls, and reserve protection shape the welfare score.
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showDesignModal ? (
+        <div onClick={() => setShowDesignModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}>
+          <div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(900px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}>
+              <div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Experiment Design</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How This Budget Context Mirrors the Four Dimensions</h2></div>
+              <button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button>
+            </div>
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Stakeholders speak in budget language like “visible support,” “real dollars,” and “scale to matter.” The planner must translate that into funding patterns, not just labels.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The budget office, equity board, and city manager stress different values, so the participant has to balance responsiveness, fairness, and operational stability.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage, equity penalty, and stability shortfall help diagnose why a budget that looks balanced on paper may still underserve one group.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden reserve bonus means the best budget keeps a stronger buffer than the stakeholder materials ever say directly.</div></div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showSolverModal ? (
+        <div onClick={() => setShowSolverModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}>
+          <div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}>
+              <div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Solver Notes</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How the Budget Solver Works</h2></div>
+              <button className="app-button secondary" onClick={() => setShowSolverModal(false)}>Close</button>
+            </div>
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Local search over budget moves</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The solver shifts budget in fixed increments between programs and keeps moves that improve the surrogate objective.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Slider meaning</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage rewards matching demand, equity penalty discourages unbalanced subgroup outcomes, stability penalty protects essential programs, and reserve bonus rewards keeping a stronger contingency buffer.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Infeasibility handling</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The total budget is hard. User-facing constraints are treated as soft targets through penalties, so the solver returns the best complete budget it can find and leaves warnings visible if targets remain unsatisfied.</div></div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const MENU_SEGMENTS = {
+  commuters: { label: "Commuters", color: "#d97a5a", count: 34 },
+  families: { label: "Families", color: "#5f8f7b", count: 33 },
+  foodies: { label: "Foodies", color: "#5c6b94", count: 33 },
+};
+const MENU_ITEMS = [
+  { id: "M1", name: "Breakfast Wrap", mealBias: "Breakfast", demand: { commuters: 18, families: 10, foodies: 4 }, budget: true, healthy: true },
+  { id: "M2", name: "Fruit Bowl", mealBias: "Breakfast", demand: { commuters: 8, families: 13, foodies: 6 }, budget: true, healthy: true },
+  { id: "M3", name: "Burger", mealBias: "Lunch", demand: { commuters: 12, families: 10, foodies: 8 }, budget: true, indulgent: true },
+  { id: "M4", name: "Grain Salad", mealBias: "Lunch", demand: { commuters: 9, families: 12, foodies: 12 }, healthy: true },
+  { id: "M5", name: "Kids Pasta", mealBias: "Dinner", demand: { commuters: 0, families: 17, foodies: 5 }, budget: true },
+  { id: "M6", name: "Chef Special", mealBias: "Dinner", demand: { commuters: 2, families: 6, foodies: 18 }, premium: true },
+  { id: "M7", name: "Taco Bowl", mealBias: "Lunch", demand: { commuters: 14, families: 9, foodies: 10 }, budget: true },
+  { id: "M8", name: "Roasted Fish", mealBias: "Dinner", demand: { commuters: 2, families: 8, foodies: 16 }, premium: true, healthy: true },
+  { id: "M9", name: "Yogurt Parfait", mealBias: "Breakfast", demand: { commuters: 10, families: 10, foodies: 8 }, healthy: true },
+].map((item) => ({ ...item, totalDemand: Object.values(item.demand).reduce((sum, value) => sum + value, 0) }));
+const MENU_SLOTS = [
+  { id: "MS1", meal: "Breakfast", lane: "Featured", capacity: 2 },
+  { id: "MS2", meal: "Breakfast", lane: "Regular", capacity: 2 },
+  { id: "MS3", meal: "Lunch", lane: "Featured", capacity: 2 },
+  { id: "MS4", meal: "Lunch", lane: "Regular", capacity: 2 },
+  { id: "MS5", meal: "Dinner", lane: "Featured", capacity: 2 },
+  { id: "MS6", meal: "Dinner", lane: "Regular", capacity: 2 },
+];
+const MENU_SLOT_MAP = Object.fromEntries(MENU_SLOTS.map((slot) => [slot.id, slot]));
+const MENU_ITEM_MAP = Object.fromEntries(MENU_ITEMS.map((item) => [item.id, item]));
+const MENU_TRUE_WEIGHTS = { coverage: 10, pricePenalty: 2.1, varietyPenalty: 2.2, comboBonus: 1 };
+const MENU_DEFAULT_WEIGHTS = { coverage: 10, pricePenalty: 2.1, varietyPenalty: 2.2, comboBonus: 0 };
+const MENU_DEFAULT_CONSTRAINTS = { includeHealthyLunch: false, keepBudgetBreakfast: false };
+const MENU_PRECOMPUTED_REFERENCE = { M1: "MS1", M2: "MS2", M3: "MS3", M4: "MS4", M5: "MS6", M6: "MS5", M7: "MS4", M8: "MS6", M9: "MS2" };
+
+function MenuItemChip({ item, dragging = false }) {
+  const draggable = useDraggable({ id: `menu-${item.id}`, data: { type: "menu-item", itemId: item.id } });
+  return (
+    <div ref={draggable.setNodeRef} {...draggable.attributes} {...draggable.listeners} className="course-chip" style={{ transform: CSS.Translate.toString(draggable.transform), transition: draggable.transition, opacity: dragging || draggable.isDragging ? 0.45 : 1, cursor: "grab", userSelect: "none", touchAction: "none", padding: "8px 10px", borderRadius: 12, border: `1px solid ${getDemandColor(item.totalDemand)}`, background: `${getDemandColor(item.totalDemand)}18`, display: "grid", gap: 2, fontSize: 11, lineHeight: 1.25, position: "relative" }}>
+      <strong>{item.id}</strong>
+      <span>{item.name}</span>
+      <span style={{ color: COLORS.muted }}>Demand {item.totalDemand}</span>
+      <div className="course-chip-tooltip">
+        <div><strong>{item.id}</strong> demand</div>
+        <div>Commuters: {item.demand.commuters}</div>
+        <div>Families: {item.demand.families}</div>
+        <div>Foodies: {item.demand.foodies}</div>
+      </div>
+    </div>
+  );
+}
+
+function MenuDropZone({ id, title, subtitle, items, load, activeItemId, isHolding = false }) {
+  const droppable = useDroppable({ id });
+  const isFull = !isHolding && load >= MENU_SLOT_MAP[id]?.capacity;
+  return (
+    <div ref={droppable.setNodeRef} style={{ minHeight: isHolding ? 118 : 174, borderRadius: 16, border: `1px solid ${droppable.isOver ? (isFull ? COLORS.danger : COLORS.accent) : isFull ? COLORS.warning : COLORS.border}`, background: droppable.isOver ? (isFull ? "#fff2ef" : "#eef5f6") : "#fff", padding: 12, display: "grid", alignContent: "start", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+        <div><div style={{ fontWeight: 700, fontSize: 13 }}>{title}</div>{subtitle ? <div style={{ fontSize: 11, color: COLORS.muted }}>{subtitle}</div> : null}</div>
+        {!isHolding ? <div style={{ fontSize: 11, color: isFull ? COLORS.warning : COLORS.muted }}>{load}/{MENU_SLOT_MAP[id]?.capacity}</div> : null}
+      </div>
+      <div style={{ display: "grid", gap: 8 }}>
+        {items.map((item) => <MenuItemChip key={item.id} item={item} dragging={activeItemId === item.id} />)}
+        {items.length === 0 ? <div style={{ fontSize: 11, color: COLORS.muted }}>{isHolding ? "All menu items assigned." : "Drop item here"}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+function evaluateMenuAssignment(assignment, weights = MENU_DEFAULT_WEIGHTS, constraints = MENU_DEFAULT_CONSTRAINTS) {
+  const totalPopulation = Object.values(MENU_SEGMENTS).reduce((sum, segment) => sum + segment.count, 0);
+  const perGroup = {};
+  const placedItems = MENU_ITEMS.filter((item) => assignment[item.id]);
+  Object.entries(MENU_SEGMENTS).forEach(([segment, config]) => {
+    const preferredItems = MENU_ITEMS.filter((item) => item.demand[segment] > 0);
+    const coverage = preferredItems.filter((item) => assignment[item.id]).length / preferredItems.length;
+    const pricePenalty =
+      segment === "commuters"
+        ? placedItems.filter((item) => item.premium).length * 0.4
+        : segment === "families"
+        ? placedItems.filter((item) => !item.budget).length * 0.25
+        : placedItems.filter((item) => assignment[item.id] && MENU_SLOT_MAP[assignment[item.id]]?.meal !== item.mealBias).length * 0.3;
+    const mealsCovered = new Set(placedItems.filter((item) => item.demand[segment] > 0).map((item) => MENU_SLOT_MAP[assignment[item.id]]?.meal)).size;
+    const varietyPenalty = Math.max(0, 3 - mealsCovered) * 0.5;
+    const comboBonus = placedItems.some((item) => item.healthy && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Lunch") &&
+      placedItems.some((item) => item.budget && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Lunch")
+      ? 1
+      : 0;
+    const utility =
+      MENU_TRUE_WEIGHTS.coverage * coverage -
+      MENU_TRUE_WEIGHTS.pricePenalty * pricePenalty -
+      MENU_TRUE_WEIGHTS.varietyPenalty * varietyPenalty +
+      MENU_TRUE_WEIGHTS.comboBonus * comboBonus;
+    perGroup[segment] = { group: segment, label: config.label, color: config.color, avgUtility: utility, coverage };
+  });
+
+  const coverage = Object.entries(perGroup).reduce((sum, [segment, entry]) => sum + entry.coverage * MENU_SEGMENTS[segment].count, 0) / totalPopulation;
+  const pricePenalty = Object.values(perGroup).reduce((sum, entry) => sum + Math.max(0, 5 - entry.avgUtility), 0) / 10;
+  const varietyPenalty = Object.values(perGroup).reduce((sum, entry) => sum + Math.max(0, 0.9 - entry.coverage), 0);
+  const comboBonus = placedItems.some((item) => item.healthy && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Lunch") &&
+    placedItems.some((item) => item.budget && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Lunch") ? 1 : 0;
+  const surrogateScore =
+    weights.coverage * coverage -
+    weights.pricePenalty * pricePenalty -
+    weights.varietyPenalty * varietyPenalty +
+    weights.comboBonus * comboBonus;
+  const trueScore =
+    MENU_TRUE_WEIGHTS.coverage * coverage -
+    MENU_TRUE_WEIGHTS.pricePenalty * pricePenalty -
+    MENU_TRUE_WEIGHTS.varietyPenalty * varietyPenalty +
+    MENU_TRUE_WEIGHTS.comboBonus * comboBonus;
+  const violations = [];
+  const loads = Object.fromEntries(MENU_SLOTS.map((slot) => [slot.id, 0]));
+  Object.values(assignment).forEach((slotId) => { if (slotId) loads[slotId] += 1; });
+  Object.entries(loads).forEach(([slotId, load]) => { if (load > MENU_SLOT_MAP[slotId].capacity) violations.push(`Capacity exceeded in ${MENU_SLOT_MAP[slotId].meal} ${MENU_SLOT_MAP[slotId].lane}`); });
+  if (constraints.includeHealthyLunch) {
+    const hasHealthyLunch = placedItems.some((item) => item.healthy && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Lunch");
+    if (!hasHealthyLunch) violations.push("Lunch menu is missing a healthy option");
+  }
+  if (constraints.keepBudgetBreakfast) {
+    const budgetBreakfastCount = placedItems.filter((item) => item.budget && MENU_SLOT_MAP[assignment[item.id]]?.meal === "Breakfast").length;
+    if (budgetBreakfastCount === 0) violations.push("Breakfast menu lacks a budget-friendly option");
+  }
+  return { trueScore, surrogateScore, penalizedSurrogate: surrogateScore - violations.length * 100000, perGroup, coverage, pricePenalty, varietyPenalty, comboBonus, violations };
+}
+
+function solveMenuAssignment(weights, constraints, seed) {
+  const rng = createRng(seed);
+  let current = Object.fromEntries(MENU_ITEMS.map((item) => [item.id, null]));
+  let loads = Object.fromEntries(MENU_SLOTS.map((slot) => [slot.id, 0]));
+  const ordered = [...MENU_ITEMS].sort((left, right) => right.totalDemand - left.totalDemand);
+  ordered.forEach((item) => {
+    let bestSlot = null;
+    let bestScore = -Infinity;
+    MENU_SLOTS.forEach((slot) => {
+      if (loads[slot.id] >= slot.capacity) return;
+      const trial = { ...current, [item.id]: slot.id };
+      const score = evaluateMenuAssignment(trial, weights, constraints).penalizedSurrogate;
+      if (score > bestScore) {
+        bestScore = score;
+        bestSlot = slot.id;
+      }
+    });
+    current[item.id] = bestSlot;
+    if (bestSlot) loads[bestSlot] += 1;
+  });
+  let currentMetrics = evaluateMenuAssignment(current, weights, constraints);
+  let best = { assignment: { ...current }, metrics: currentMetrics };
+  for (let step = 0; step < 6000; step += 1) {
+    const next = { ...current };
+    const first = MENU_ITEMS[Math.floor(rng() * MENU_ITEMS.length)];
+    if (rng() < 0.6) {
+      const slot = MENU_SLOTS[Math.floor(rng() * MENU_SLOTS.length)];
+      next[first.id] = slot.id;
+    } else {
+      const second = MENU_ITEMS[Math.floor(rng() * MENU_ITEMS.length)];
+      if (second.id === first.id) continue;
+      [next[first.id], next[second.id]] = [next[second.id], next[first.id]];
+    }
+    const nextMetrics = evaluateMenuAssignment(next, weights, constraints);
+    if (nextMetrics.penalizedSurrogate > currentMetrics.penalizedSurrogate || rng() < 0.02) {
+      current = next;
+      currentMetrics = nextMetrics;
+      if (nextMetrics.penalizedSurrogate > best.metrics.penalizedSurrogate) {
+        best = { assignment: { ...next }, metrics: nextMetrics };
+      }
+    }
+  }
+  return best;
+}
+
+function MenuWorkbench() {
+  const [round, setRound] = useState(1);
+  const [assignment, setAssignment] = useState(Object.fromEntries(MENU_ITEMS.map((item) => [item.id, null])));
+  const [weights, setWeights] = useState(MENU_DEFAULT_WEIGHTS);
+  const [constraints, setConstraints] = useState({ ...MENU_DEFAULT_CONSTRAINTS });
+  const [solverSeed, setSolverSeed] = useState(444);
+  const [activeItemId, setActiveItemId] = useState(null);
+  const [toast, setToast] = useState("");
+  const [showUtilityModal, setShowUtilityModal] = useState(false);
+  const [showDesignModal, setShowDesignModal] = useState(false);
+  const [showSolverModal, setShowSolverModal] = useState(false);
+  const [isSolving, setIsSolving] = useState(false);
+  const [solveSummary, setSolveSummary] = useState("No solve run yet.");
+  const metrics = useMemo(() => evaluateMenuAssignment(assignment, weights, constraints), [assignment, weights, constraints]);
+  const savedReference = useMemo(() => solveMenuAssignment(MENU_TRUE_WEIGHTS, MENU_DEFAULT_CONSTRAINTS, 1201), []);
+  const totalPopulation = Object.values(MENU_SEGMENTS).reduce((sum, segment) => sum + segment.count, 0);
+  const layout = useMemo(() => {
+    const bySlot = Object.fromEntries(MENU_SLOTS.map((slot) => [slot.id, []]));
+    const unassigned = [];
+    MENU_ITEMS.forEach((item) => {
+      const slotId = assignment[item.id];
+      if (slotId && bySlot[slotId]) bySlot[slotId].push(item);
+      else unassigned.push(item);
+    });
+    return { bySlot, unassigned };
+  }, [assignment]);
+  const loads = Object.fromEntries(MENU_SLOTS.map((slot) => [slot.id, 0]));
+  Object.values(assignment).forEach((slotId) => { if (slotId) loads[slotId] += 1; });
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const activeItem = activeItemId ? MENU_ITEM_MAP[activeItemId] : null;
+  const bars = Object.values(metrics.perGroup).map((entry) => ({ name: entry.label, value: entry.avgUtility, color: entry.color }));
+
+  useEffect(() => {
+    if (!toast) return undefined;
+    const timer = window.setTimeout(() => setToast(""), 2200);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  return (
+    <div style={{ display: "grid", gap: 14, maxWidth: 1660, minWidth: 1540, margin: "0 auto" }}>
+      <header style={panelStyle({ padding: 16, display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center", flexWrap: "wrap" })}>
+        <div>
+          <div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.1em", textTransform: "uppercase" }}>Alternate Context</div>
+          <h1 style={{ margin: "4px 0 0", fontSize: 28 }}>Menu Design Experiment Workbench</h1>
+          <div style={{ color: COLORS.muted, fontSize: 13, marginTop: 4 }}>A menu-composition problem that keeps the same experiment shell but changes the decision surface.</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 12, background: COLORS.accentSoft }}>
+            <span style={{ fontSize: 12, color: COLORS.muted }}>Round</span>
+            <button className="app-button ghost" onClick={() => setRound((value) => Math.max(1, value - 1))}>-</button>
+            <strong>{round}</strong>
+            <button className="app-button ghost" onClick={() => setRound((value) => value + 1)}>+</button>
+          </div>
+          <button className="app-button secondary" onClick={() => setShowUtilityModal(true)}>Show True Utility</button>
+          <button className="app-button secondary" onClick={() => setShowDesignModal(true)}>Design Intent</button>
+          <button className="app-button secondary" onClick={() => setShowSolverModal(true)}>How Solver Works</button>
+          <button className="app-button secondary" onClick={() => {
+            setAssignment(Object.fromEntries(MENU_ITEMS.map((item) => [item.id, null])));
+            setWeights(MENU_DEFAULT_WEIGHTS);
+            setConstraints({ ...MENU_DEFAULT_CONSTRAINTS });
+            setRound(1);
+            setToast("Reset to empty menu.");
+          }}>Reset</button>
+        </div>
+      </header>
+
+      <div style={{ display: "grid", gridTemplateColumns: "290px minmax(820px, 1fr) 520px", gap: 14, alignItems: "stretch" }}>
+        <aside style={{ display: "grid", gap: 14, height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+          <SectionCard title="Population Overview">
+            {Object.entries(MENU_SEGMENTS).map(([segment, config]) => (
+              <div key={segment} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                <span>{config.label}</span>
+                <span>{config.count} ({formatNumber((config.count / totalPopulation) * 100)}%)</span>
+              </div>
+            ))}
+            <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>
+              The customer mix is public. What remains hidden is how variety, price pressure, and combo effects map into welfare.
+            </div>
+          </SectionCard>
+          <SectionCard title="Customer Voices">
+            <div style={{ borderLeft: `4px solid ${MENU_SEGMENTS.commuters.color}`, borderRadius: 12, background: "#fbfcfd", padding: 12, display: "grid", gap: 8 }}><strong style={{ fontSize: 12 }}>Commuter Customers</strong><div style={{ fontSize: 12, lineHeight: 1.45 }}>Fast, reliable breakfast and lunch options matter more than premium dinner choices. A menu with no affordable quick picks misses the everyday crowd.</div></div>
+            <div style={{ borderLeft: `4px solid ${MENU_SEGMENTS.families.color}`, borderRadius: 12, background: "#fbfcfd", padding: 12, display: "grid", gap: 8 }}><strong style={{ fontSize: 12 }}>Families</strong><div style={{ fontSize: 12, lineHeight: 1.45 }}>A menu needs broad coverage and at least one clearly healthy option at lunch or dinner. If every meal looks expensive or indulgent, families tune out.</div></div>
+            <div style={{ borderLeft: `4px solid ${MENU_SEGMENTS.foodies.color}`, borderRadius: 12, background: "#fbfcfd", padding: 12, display: "grid", gap: 8 }}><strong style={{ fontSize: 12 }}>Foodies</strong><div style={{ fontSize: 12, lineHeight: 1.45 }}>Special items can come later in the meal cycle, but they need a real place on the menu. A purely safe menu feels flat.</div></div>
+          </SectionCard>
+        </aside>
+
+        <main style={{ display: "grid", gap: 14 }}>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={(event) => setActiveItemId(event.active.id.replace("menu-", ""))} onDragEnd={(event) => {
+            setActiveItemId(null);
+            const rawId = event.active?.id;
+            const targetId = event.over?.id;
+            if (!rawId || !targetId) return;
+            const itemId = rawId.replace("menu-", "");
+            if (targetId === "menu-holding") {
+              setAssignment((current) => ({ ...current, [itemId]: null }));
+              return;
+            }
+            if (!MENU_SLOT_MAP[targetId]) return;
+            setAssignment((current) => ({ ...current, [itemId]: targetId }));
+          }}>
+            <section style={panelStyle({ padding: 16, display: "grid", gap: 14 })}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                <div>
+                  <div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Menu Layout</div>
+                  <div style={{ fontSize: 13 }}>Build a menu across breakfast, lunch, and dinner sections.</div>
+                </div>
+                <div style={{ fontSize: 12, color: metrics.violations.length ? COLORS.danger : COLORS.success }}>
+                  {metrics.violations.length ? `${metrics.violations.length} active warnings` : "No active warnings"}
+                </div>
+              </div>
+              {isSolving ? <div style={{ borderRadius: 12, background: "#eef5f6", border: `1px solid ${COLORS.border}`, padding: "10px 12px", display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}><div className="solver-spinner" /><span>Solver is searching and will load the best menu composition into this grid.</span></div> : null}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(200px, 1fr))", gap: 12 }}>
+                {["Breakfast", "Lunch", "Dinner"].map((meal, index) => (
+                  <div key={meal} style={{ display: "grid", gap: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>{meal}</div>
+                    {["Featured", "Regular"].map((lane) => {
+                      const slot = MENU_SLOTS[index * 2 + (lane === "Featured" ? 0 : 1)];
+                      return <MenuDropZone key={slot.id} id={slot.id} title={`${meal} ${lane}`} subtitle={lane} items={layout.bySlot[slot.id]} load={loads[slot.id]} activeItemId={activeItemId} />;
+                    })}
+                  </div>
+                ))}
+              </div>
+              <MenuDropZone id="menu-holding" title="Available Dishes" subtitle="Drag onto the menu" items={layout.unassigned} load={layout.unassigned.length} activeItemId={activeItemId} isHolding />
+            </section>
+            <DragOverlay>{activeItem ? <MenuItemChip item={activeItem} dragging /> : null}</DragOverlay>
+          </DndContext>
+        </main>
+
+        <aside style={{ display: "grid", height: "calc(100vh - 210px)", overflow: "auto", alignContent: "start", paddingRight: 2 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 220px", gap: 14, alignItems: "start" }}>
+            <SectionCard title="Metrics">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div style={panelStyle({ padding: 12 })}><div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Current F(x)</div><div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber(metrics.trueScore)}</div></div>
+                <div style={panelStyle({ padding: 12, borderColor: COLORS.success })}><div style={{ fontSize: 11, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>% of Saved Reference</div><div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{formatNumber((metrics.trueScore / savedReference.metrics.trueScore) * 100)}%</div></div>
+              </div>
+              <div style={{ height: 170 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Average Utility by Segment</div>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={bars} layout="vertical" margin={{ left: 0, right: 10, top: 4, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#edf0f2" />
+                    <XAxis type="number" tick={{ fontSize: 11 }} />
+                    <YAxis type="category" dataKey="name" width={80} tick={{ fontSize: 11 }} />
+                    <Tooltip formatter={(value) => formatNumber(value)} />
+                    <Bar dataKey="value" radius={[0, 8, 8, 0]}>
+                      {bars.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div style={{ display: "grid", gap: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 700 }}>Menu Summary</div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Coverage</span><span>{formatNumber(metrics.coverage * 100)}%</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Price penalty</span><span>{formatNumber(metrics.pricePenalty, 2)}</span></div>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>Variety penalty</span><span>{formatNumber(metrics.varietyPenalty, 2)}</span></div>
+              </div>
+            </SectionCard>
+            <SectionCard title="Solver">
+              <button className="app-button primary" onClick={() => {
+                if (isSolving) return;
+                setIsSolving(true);
+                setSolveSummary("Searching menu layouts...");
+                window.setTimeout(() => {
+                  const result = solveMenuAssignment(weights, constraints, solverSeed);
+                  setAssignment(result.assignment);
+                  setSolveSummary(result.metrics.violations.length ? "Loaded best menu with warnings." : "Menu solution loaded.");
+                  setToast(result.metrics.violations.length ? "Solved with warnings." : "Menu solved.");
+                  setIsSolving(false);
+                }, 40);
+              }} disabled={isSolving}>{isSolving ? "Solving..." : "Solve"}</button>
+              <button className="app-button secondary" onClick={() => {
+                if (isSolving) return;
+                setIsSolving(true);
+                setSolveSummary("Searching alternative menu layouts...");
+                window.setTimeout(() => {
+                  const result = solveMenuAssignment(weights, constraints, solverSeed + 31);
+                  setAssignment(result.assignment);
+                  setSolverSeed((current) => current + 17);
+                  setSolveSummary(result.metrics.violations.length ? "Loaded alternative menu with warnings." : "Alternative menu loaded.");
+                  setToast(result.metrics.violations.length ? "Solved with warnings." : "Alternative menu solved.");
+                  setIsSolving(false);
+                }, 40);
+              }} disabled={isSolving}>{isSolving ? "Working..." : "Re-solve"}</button>
+              <button className="app-button secondary" onClick={() => {
+                setAssignment(MENU_PRECOMPUTED_REFERENCE);
+                setWeights({ ...MENU_TRUE_WEIGHTS });
+                setConstraints({ ...MENU_DEFAULT_CONSTRAINTS });
+                setSolveSummary("Loaded the saved reference menu.");
+              }} disabled={isSolving}>Load Saved Reference</button>
+              <div style={panelStyle({ padding: 10, background: "#fbfcfd" })}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <div className={isSolving ? "solver-spinner" : "solver-spinner idle"} />
+                  <strong style={{ fontSize: 12 }}>{isSolving ? "Solver running" : "Solver status"}</strong>
+                </div>
+                <div style={{ fontSize: 11, color: COLORS.muted, lineHeight: 1.45 }}>{solveSummary}</div>
+              </div>
+              {[
+                ["coverage", "coverage"],
+                ["pricePenalty", "price penalty"],
+                ["varietyPenalty", "variety"],
+                ["comboBonus", "combo bonus"],
+              ].map(([key, label]) => (
+                <label key={key} style={{ display: "grid", gap: 4 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}><span>{label}</span><strong>{weights[key]}</strong></div>
+                  <input type="range" min="0" max="12" step="0.5" value={weights[key]} onChange={(event) => setWeights((current) => ({ ...current, [key]: Number(event.target.value) }))} />
+                </label>
+              ))}
+              <div style={{ fontSize: 12, fontWeight: 700, marginTop: 6 }}>Simple Constraints</div>
+              <label className="check-row compact"><input type="checkbox" checked={constraints.includeHealthyLunch} onChange={(event) => setConstraints((current) => ({ ...current, includeHealthyLunch: event.target.checked }))} /><span>Require healthy lunch option</span></label>
+              <label className="check-row compact"><input type="checkbox" checked={constraints.keepBudgetBreakfast} onChange={(event) => setConstraints((current) => ({ ...current, keepBudgetBreakfast: event.target.checked }))} /><span>Require budget breakfast option</span></label>
+            </SectionCard>
+          </div>
+        </aside>
+      </div>
+
+      <footer style={panelStyle({ padding: "12px 16px", display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", fontSize: 13 })}>
+        <span>Current F(x) = {formatNumber(metrics.trueScore)}</span>
+        <span>Saved reference F(x_ref) = {formatNumber(savedReference.metrics.trueScore)}</span>
+        <span>Gap to reference = {formatNumber(((savedReference.metrics.trueScore - metrics.trueScore) / savedReference.metrics.trueScore) * 100)}%</span>
+        <span>Round {round}</span>
+      </footer>
+
+      {toast ? <div style={{ position: "fixed", top: 18, right: 18, background: COLORS.accent, color: "#fff", borderRadius: 12, padding: "10px 14px", fontSize: 12, boxShadow: "0 14px 30px rgba(39, 76, 87, 0.24)" }}>{toast}</div> : null}
+      {showUtilityModal ? <div onClick={() => setShowUtilityModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Hidden Objective</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>Menu Design True Utility</h2></div><button className="app-button secondary" onClick={() => setShowUtilityModal(false)}>Close</button></div><div style={panelStyle({ padding: 14, background: "#fbfcfd" })}><code style={{ fontSize: 13 }}>U_g(x) = 10 * Coverage_g(x) - 2.1 * PricePenalty_g(x) - 2.2 * VarietyPenalty_g(x) + 1 * ComboBenefit_g(x)</code><div style={{ marginTop: 10 }}><code style={{ fontSize: 13 }}>F(x) = \u2211_g p_g U_g(x)</code></div><div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}><strong>Coverage_g(x)</strong> measures how well the menu serves segment <code>g</code>.<br /><strong>PricePenalty_g(x)</strong> captures how inaccessible the menu becomes for that segment.<br /><strong>VarietyPenalty_g(x)</strong> penalizes menus that underserve different meal contexts for that segment.<br /><strong>ComboBenefit_g(x)</strong> reflects the value of having both a healthy and a budget-friendly lunch option.</div></div><div style={{ fontSize: 13, lineHeight: 1.6 }}>The customer mix is public. The hidden part is the exact mapping from menu composition to welfare, including the hidden value of a healthy-plus-budget lunch combination.</div></div></div> : null}
+      {showDesignModal ? <div onClick={() => setShowDesignModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(900px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Experiment Design</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How This Menu Context Mirrors the Four Dimensions</h2></div><button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button></div><div style={{ display: "grid", gap: 10 }}><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Customer voices use menu language like “quick,” “healthy,” and “special enough,” which still has to be translated into the right objective adjustments.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Commuters, families, and foodies each want a different balance of budget, health, and novelty.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage, price pressure, and variety help explain why a menu that looks broad may still fail one segment.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden combo bonus rewards having both a healthy and a budget-friendly lunch option even if stakeholders never articulate that exact rule.</div></div></div></div></div> : null}
+      {showSolverModal ? <div onClick={() => setShowSolverModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Solver Notes</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How the Menu Solver Works</h2></div><button className="app-button secondary" onClick={() => setShowSolverModal(false)}>Close</button></div><div style={{ display: "grid", gap: 10 }}><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Greedy plus local search</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Menu items are assigned to meal sections, then improved with random moves and swaps.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Slider meaning</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage rewards serving more desired items, price penalty discourages inaccessible menus, variety penalty punishes narrow menus, and combo bonus rewards healthy-budget lunch combinations.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Infeasibility handling</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Section capacities are hard. User-facing constraints are soft targets, so the solver returns the best complete menu it can find and leaves warnings visible if targets remain unsatisfied.</div></div></div></div></div> : null}
+    </div>
+  );
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState("timetable");
 
@@ -2103,12 +3079,15 @@ function App() {
           <button className={`app-button ${activeTab === "timetable" ? "primary" : "secondary"}`} onClick={() => setActiveTab("timetable")}>
             Timetabling Workbench
           </button>
-          <button className={`app-button ${activeTab === "resource" ? "primary" : "secondary"}`} onClick={() => setActiveTab("resource")}>
-            Resource Allocation Workbench
+          <button className={`app-button ${activeTab === "budget" ? "primary" : "secondary"}`} onClick={() => setActiveTab("budget")}>
+            Budget Allocation Workbench
+          </button>
+          <button className={`app-button ${activeTab === "menu" ? "primary" : "secondary"}`} onClick={() => setActiveTab("menu")}>
+            Menu Design Workbench
           </button>
         </div>
       </div>
-      {activeTab === "timetable" ? <TimetableWorkbench /> : <ResourceWorkbench />}
+      {activeTab === "timetable" ? <TimetableWorkbench /> : activeTab === "budget" ? <BudgetWorkbench /> : <MenuWorkbench />}
     </div>
   );
 }
