@@ -163,10 +163,10 @@ const BRIEFINGS = [
   {
     id: "briefing-advisor",
     title: "Faculty Advisor",
-    role: "Diagnosis",
+    role: "Evaluation",
     text: "When students complain, it is usually because their week feels fragmented. A timetable can look acceptable overall while still producing miserable schedules for one group.",
     interpretation:
-      "Correct interpretation: use subgroup metrics to diagnose hidden failure modes. This is the simplified diagnosis cue from the writeup.",
+      "Correct interpretation: this is an invitation to probe the solution — look at subgroup breakdowns, ask why a group is underperforming, and stress-test whether the schedule holds if population mix shifts.",
   },
 ];
 
@@ -194,13 +194,6 @@ const TERM_LIBRARY = {
     defaultWeight: 2.5,
     score: (outcome) => outcome.compactnessPenalty,
   },
-  friday_bonus: {
-    label: "Friday-free bonus",
-    description: "Bonus for each student who has zero classes on Friday.",
-    sign: +1,
-    defaultWeight: 1,
-    score: (outcome) => outcome.fridayBonus,
-  },
 };
 
 // The hidden true utility — known to the experimenter, never shown to participants.
@@ -209,7 +202,6 @@ const TRUE_SPEC = {
     { id: "coverage", weight: 10 },
     { id: "time_penalty", weight: 2 },
     { id: "compactness", weight: 2.5 },
-    { id: "friday_bonus", weight: 1 },
   ],
 };
 
@@ -222,7 +214,6 @@ const DEFAULT_MODEL_SPEC = {
 
 const DEFAULT_CONSTRAINTS = {
   noAthleteMwfMorning: false,
-  preferFridayFree: false,
 };
 const PRECOMPUTED_OPTIMAL_ASSIGNMENT = {
   C1: "T5",
@@ -362,20 +353,16 @@ function computeStudentOutcome(student, assignment) {
   const singleBlockDays = DAYS.filter((day) => blocksByDay[day].size === 1).length;
   const compactnessPenalty =
     config.compactDayWeight * daysWithClasses + config.singleBlockWeight * singleBlockDays;
-  const fridayBonus = countsByDay.Fri === 0 ? 1 : 0;
-
   return {
     coverage,
     timePenalty,
     compactnessPenalty,
-    fridayBonus,
     daysWithClasses,
     singleBlockDays,
-    hasFridayClasses: countsByDay.Fri > 0,
   };
 }
 
-function computeConstraintViolations(assignment, metrics, constraints) {
+function computeConstraintViolations(assignment, constraints) {
   const violations = [];
   const loads = getSlotLoads(assignment);
 
@@ -392,11 +379,6 @@ function computeConstraintViolations(assignment, metrics, constraints) {
     if (blocked.length > 0) violations.push("Athlete-demanded courses placed in MWF mornings");
   }
 
-  if (constraints.preferFridayFree) {
-    if (metrics.fridayFreeRate < 0.55) {
-      violations.push("Friday-free rate is below the experiment target");
-    }
-  }
 
   return violations;
 }
@@ -477,7 +459,6 @@ function evaluateAssignment(assignment, students, modelSpec, constraints) {
   }).length;
 
   const overallCoverage = studentRows.filter((row) => row.coverage === 1).length / studentRows.length;
-  const fridayFreeRate = studentRows.filter((row) => !row.hasFridayClasses).length / studentRows.length;
   const commuterFragmentation = perGroup.commuter?.avgSingleBlockDays ?? 0;
 
   const metrics = {
@@ -486,13 +467,12 @@ function evaluateAssignment(assignment, students, modelSpec, constraints) {
     components: componentTotals,
     perGroup,
     overallCoverage,
-    fridayFreeRate,
     commuterFragmentation,
     courseConflictCount,
     studentRows,
   };
 
-  const violations = computeConstraintViolations(assignment, metrics, constraints);
+  const violations = computeConstraintViolations(assignment, constraints);
   return {
     ...metrics,
     violations,
@@ -865,7 +845,7 @@ function TimetableWorkbench() {
             </div>
             <h1 style={{ margin: "4px 0 0", fontSize: 28 }}>Timetable Experiment Workbench</h1>
             <div style={{ color: COLORS.muted, fontSize: 13, marginTop: 4 }}>
-              Grounded in the writeup, simplified to interpretation, prioritization, diagnosis, and one hidden discovery.
+              Grounded in the writeup: interpretation, prioritization, and evaluation &amp; critique.
             </div>
           </div>
 
@@ -1081,14 +1061,10 @@ function TimetableWorkbench() {
                 </div>
 
                 <div style={{ display: "grid", gap: 8 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700 }}>Diagnosis Summary</div>
+                  <div style={{ fontSize: 12, fontWeight: 700 }}>Schedule Diagnostics</div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
                     <span>Popular-course conflicts</span>
                     <span>{currentMetrics.courseConflictCount}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
-                    <span>Friday-free rate</span>
-                    <span>{formatNumber(currentMetrics.fridayFreeRate * 100)}%</span>
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
                     <span>Commuter fragmentation</span>
@@ -1197,15 +1173,6 @@ function TimetableWorkbench() {
                   <span>No MWF morning courses with athlete demand</span>
                 </label>
 
-                <label className="check-row compact">
-                  <input
-                    type="checkbox"
-                    checked={constraints.preferFridayFree}
-                    onChange={(event) => updateConstraint("preferFridayFree", event.target.checked)}
-                  />
-                  <span>Favor Friday-free schedules</span>
-                </label>
-
                 {currentMetrics.violations.length ? (
                   <div style={{ display: "grid", gap: 6, fontSize: 11, color: COLORS.danger }}>
                     {currentMetrics.violations.map((warning) => (
@@ -1301,14 +1268,14 @@ function TimetableWorkbench() {
               <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}>
                 <strong>AvgStudentUtility_g(x)</strong> is the average student-level utility in group <code>g</code>, where student utility is computed as
                 <br />
-                <code>10 * coverage - 2 * time_penalty - 2.5 * compactness_penalty + 1 * friday_bonus</code>.
+                <code>10 * coverage - 2 * time_penalty - 2.5 * compactness_penalty</code>.
                 <br />
                 <strong>p_g</strong> is the public population share of each group.
               </div>
             </div>
 
             <div style={{ fontSize: 13, lineHeight: 1.55 }}>
-              This simplified prototype keeps the writeup's core logic. The subgroup composition is public to the planner; what remains hidden is the exact welfare mapping, the strength of tradeoffs, and the Friday bonus.
+              This prototype keeps the writeup's core logic. The subgroup composition is public to the planner; what remains hidden is the exact welfare mapping and the strength of tradeoffs between coverage, time-of-day preferences, and compactness.
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1.15fr 1fr", gap: 14 }}>
@@ -1397,32 +1364,26 @@ function TimetableWorkbench() {
             </div>
 
             <div style={{ fontSize: 13, lineHeight: 1.6 }}>
-              This prototype is a simplified version of the writeup's timetabling experiment. The goal is to preserve the four cognitive dimensions while reducing the number of groups, controls, and metrics so the workbench is easier to use and debug.
+              This prototype embeds three cognitive dimensions. Each one places a distinct demand on the planner and maps to a measurable component of the true utility.
             </div>
 
             <div style={{ display: "grid", gap: 10 }}>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
                 <strong style={{ fontSize: 12 }}>Interpretation</strong>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The student voices use ordinary language rather than parameter names. The planner already knows the subgroup mix; the challenge is translating narrative language into the right model changes.
+                  The student voices use ordinary language rather than parameter names. "Compact" could mean eliminating gaps, reducing campus days, or packing into mornings — only one reading matches the true utility. The challenge is translating vague narratives into the right model terms and weights.
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
                 <strong style={{ fontSize: 12 }}>Prioritization</strong>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The stakeholder briefings intentionally emphasize different values: coverage, equity, and humane schedules. No single stakeholder gives the whole answer, so participants must decide how to balance competing concerns.
+                  The stakeholder briefings advocate for incompatible values: coverage above all, equity for vulnerable groups, humane scheduling. No single stakeholder is fully right. Participants must decide how to weight competing concerns — and the optimal balance is not stated anywhere.
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
-                <strong style={{ fontSize: 12 }}>Diagnosis</strong>
+                <strong style={{ fontSize: 12 }}>Evaluation &amp; Critique</strong>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The metrics are chosen to support diagnosis rather than to reveal the objective directly. Coverage, subgroup utility, conflict count, Friday-free rate, and commuter fragmentation help explain why a timetable underperforms and which group is being harmed.
-                </div>
-              </div>
-              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
-                <strong style={{ fontSize: 12 }}>Discovery</strong>
-                <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  The hidden structure is lighter than in the full writeup but still deliberate. The true objective rewards Friday-free schedules, and athlete preferences are narrower than a simple “no mornings” rule. Participants should only uncover those through experimentation and comparison.
+                  After building a model and seeing a solution, participants must judge whether it is actually good. The metrics panel supports this: subgroup satisfaction, coverage breakdowns, and conflict counts let planners ask why the schedule looks the way it does, probe counterfactuals, and check whether the solution holds under different assumptions.
                 </div>
               </div>
             </div>
@@ -1502,9 +1463,6 @@ function TimetableWorkbench() {
                 </div>
                 <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
                   <strong>Campus day compactness</strong>: reduces extra campus days and isolated single-block days, strongest effect on commuters.
-                </div>
-                <div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
-                  <strong>Friday-free bonus</strong>: rewards timetables that leave more students with no Friday classes. Not in the starting model — must be discovered.
                 </div>
               </div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}>
@@ -2198,7 +2156,7 @@ function ResourceWorkbench() {
               <button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button>
             </div>
             <div style={{ display: "grid", gap: 10 }}>
-              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Voices use portfolio language like “move early,” “avoid fragmentation,” and “later is fine.” The stakeholder mix is visible; the challenge is mapping those statements into the right model weights.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Voices use portfolio language like "move early," "avoid fragmentation," and "later is fine." The stakeholder mix is visible; the challenge is mapping those statements into the right model weights.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Budget, equity, and implementation concerns intentionally pull in different directions so the participant has to balance them rather than optimize a single spoken value.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The dashboard is built to expose subgroup harm, demand conflicts, and reserve usage rather than revealing the objective directly.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden structure is that leaving projects out of the reserve quarter is globally rewarded even when stakeholders never say that outright.</div></div>
@@ -2645,7 +2603,7 @@ function BudgetWorkbench() {
               <button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button>
             </div>
             <div style={{ display: "grid", gap: 10 }}>
-              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Stakeholders speak in budget language like “visible support,” “real dollars,” and “scale to matter.” The planner must translate that into funding patterns, not just labels.</div></div>
+              <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Stakeholders speak in budget language like "visible support," "real dollars," and "scale to matter." The planner must translate that into funding patterns, not just labels.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The budget office, equity board, and city manager stress different values, so the participant has to balance responsiveness, fairness, and operational stability.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage, equity penalty, and stability shortfall help diagnose why a budget that looks balanced on paper may still underserve one group.</div></div>
               <div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden reserve bonus means the best budget keeps a stronger buffer than the stakeholder materials ever say directly.</div></div>
@@ -3063,7 +3021,7 @@ function MenuWorkbench() {
 
       {toast ? <div style={{ position: "fixed", top: 18, right: 18, background: COLORS.accent, color: "#fff", borderRadius: 12, padding: "10px 14px", fontSize: 12, boxShadow: "0 14px 30px rgba(39, 76, 87, 0.24)" }}>{toast}</div> : null}
       {showUtilityModal ? <div onClick={() => setShowUtilityModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Hidden Objective</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>Menu Design True Utility</h2></div><button className="app-button secondary" onClick={() => setShowUtilityModal(false)}>Close</button></div><div style={panelStyle({ padding: 14, background: "#fbfcfd" })}><code style={{ fontSize: 13 }}>U_g(x) = 10 * Coverage_g(x) - 2.1 * PricePenalty_g(x) - 2.2 * VarietyPenalty_g(x) + 1 * ComboBenefit_g(x)</code><div style={{ marginTop: 10 }}><code style={{ fontSize: 13 }}>F(x) = \u2211_g p_g U_g(x)</code></div><div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5 }}><strong>Coverage_g(x)</strong> measures how well the menu serves segment <code>g</code>.<br /><strong>PricePenalty_g(x)</strong> captures how inaccessible the menu becomes for that segment.<br /><strong>VarietyPenalty_g(x)</strong> penalizes menus that underserve different meal contexts for that segment.<br /><strong>ComboBenefit_g(x)</strong> reflects the value of having both a healthy and a budget-friendly lunch option.</div></div><div style={{ fontSize: 13, lineHeight: 1.6 }}>The customer mix is public. The hidden part is the exact mapping from menu composition to welfare, including the hidden value of a healthy-plus-budget lunch combination.</div></div></div> : null}
-      {showDesignModal ? <div onClick={() => setShowDesignModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(900px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Experiment Design</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How This Menu Context Mirrors the Four Dimensions</h2></div><button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button></div><div style={{ display: "grid", gap: 10 }}><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Customer voices use menu language like “quick,” “healthy,” and “special enough,” which still has to be translated into the right objective adjustments.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Commuters, families, and foodies each want a different balance of budget, health, and novelty.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage, price pressure, and variety help explain why a menu that looks broad may still fail one segment.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden combo bonus rewards having both a healthy and a budget-friendly lunch option even if stakeholders never articulate that exact rule.</div></div></div></div></div> : null}
+      {showDesignModal ? <div onClick={() => setShowDesignModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(900px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Experiment Design</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How This Menu Context Mirrors the Four Dimensions</h2></div><button className="app-button secondary" onClick={() => setShowDesignModal(false)}>Close</button></div><div style={{ display: "grid", gap: 10 }}><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Interpretation</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Customer voices use menu language like "quick," "healthy," and "special enough," which still has to be translated into the right objective adjustments.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Prioritization</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Commuters, families, and foodies each want a different balance of budget, health, and novelty.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Diagnosis</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage, price pressure, and variety help explain why a menu that looks broad may still fail one segment.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Discovery</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>The hidden combo bonus rewards having both a healthy and a budget-friendly lunch option even if stakeholders never articulate that exact rule.</div></div></div></div></div> : null}
       {showSolverModal ? <div onClick={() => setShowSolverModal(false)} style={{ position: "fixed", inset: 0, background: "rgba(18, 25, 32, 0.42)", display: "grid", placeItems: "center", padding: 18, zIndex: 10 }}><div onClick={(event) => event.stopPropagation()} style={panelStyle({ width: "min(860px, 100%)", maxHeight: "85vh", overflow: "auto", padding: 18, display: "grid", gap: 14 })}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start" }}><div><div style={{ fontSize: 12, color: COLORS.muted, letterSpacing: "0.08em", textTransform: "uppercase" }}>Solver Notes</div><h2 style={{ margin: "4px 0 0", fontSize: 24 }}>How the Menu Solver Works</h2></div><button className="app-button secondary" onClick={() => setShowSolverModal(false)}>Close</button></div><div style={{ display: "grid", gap: 10 }}><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Greedy plus local search</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Menu items are assigned to meal sections, then improved with random moves and swaps.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Slider meaning</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Coverage rewards serving more desired items, price penalty discourages inaccessible menus, variety penalty punishes narrow menus, and combo bonus rewards healthy-budget lunch combinations.</div></div><div style={panelStyle({ padding: 12, background: "#fbfcfd" })}><strong style={{ fontSize: 12 }}>Infeasibility handling</strong><div style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>Section capacities are hard. User-facing constraints are soft targets, so the solver returns the best complete menu it can find and leaves warnings visible if targets remain unsatisfied.</div></div></div></div></div> : null}
     </div>
   );
